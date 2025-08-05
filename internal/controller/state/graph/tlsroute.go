@@ -6,7 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/gateway-api/apis/v1alpha2"
 
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/state/conditions"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/conditions"
 )
 
 func buildTLSRoute(
@@ -117,6 +117,15 @@ func validateBackendRefTLSRoute(
 		backendRef.Valid = false
 
 		return backendRef, []conditions.Condition{conditions.NewRouteBackendRefRefBackendNotFound(err.Error())}
+	}
+
+	if svcPort.AppProtocol != nil {
+		err = validateRouteBackendRefAppProtocol(RouteTypeTLS, *svcPort.AppProtocol, nil)
+		if err != nil {
+			backendRef.Valid = false
+
+			return backendRef, []conditions.Condition{conditions.NewRouteBackendRefUnsupportedProtocol(err.Error())}
+		}
 	}
 
 	var conds []conditions.Condition

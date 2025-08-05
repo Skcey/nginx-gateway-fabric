@@ -4,7 +4,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/nginx/nginx-gateway-fabric)](https://goreportcard.com/report/github.com/nginx/nginx-gateway-fabric)
 [![codecov](https://codecov.io/gh/nginx/nginx-gateway-fabric/graph/badge.svg?token=32ULC8F13Z)](https://codecov.io/gh/nginx/nginx-gateway-fabric)
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/nginx/nginx-gateway-fabric?logo=github&sort=semver)](https://github.com/nginx/nginx-gateway-fabric/releases/latest)
-[![Forum](https://img.shields.io/badge/nginx--community--forum-green)](https://community.nginx.org/)
+[![Forum](https://img.shields.io/badge/nginx--community--forum-green)](https://community.nginx.org/c/projects/nginx-gateway-fabric/25)
 [![Project Status: Active – The project has reached a stable, usable state and is being actively developed.](https://www.repostatus.org/badges/latest/active.svg)](https://www.repostatus.org/#active)
 
 # NGINX Gateway Fabric
@@ -36,7 +36,7 @@ You can find the comprehensive NGINX Gateway Fabric user documentation on the [N
 We publish NGINX Gateway Fabric releases on GitHub. See
 our [releases page](https://github.com/nginx/nginx-gateway-fabric/releases).
 
-The latest release is [2.0.2](https://github.com/nginx/nginx-gateway-fabric/releases/tag/v2.0.1).
+The latest release is [2.0.2](https://github.com/nginx/nginx-gateway-fabric/releases/tag/v2.0.2).
 
 The edge version is useful for experimenting with new features that are not yet published in a release. To use, choose
 the _edge_ version built from the [latest commit](https://github.com/nginx/nginx-gateway-fabric/commits/main)
@@ -68,7 +68,7 @@ The following table lists the software versions NGINX Gateway Fabric supports.
 
 | NGINX Gateway Fabric | Gateway API | Kubernetes | NGINX OSS | NGINX Plus | NGINX Agent |
 |----------------------|-------------|------------|-----------|------------|-------------|
-| Edge                 | 1.3.0       | 1.25+      | 1.28.0    | R34        | v3.0.1      |
+| Edge                 | 1.3.0       | 1.25+      | 1.29.0    | R34        | v3.2.0      |
 | 2.0.2                | 1.3.0       | 1.25+      | 1.28.0    | R34        | v3.0.1      |
 | 2.0.1                | 1.3.0       | 1.25+      | 1.28.0    | R34        | v3.0.1      |
 | 2.0.0                | 1.3.0       | 1.25+      | 1.28.0    | R34        | v3.0.0      |
@@ -118,7 +118,7 @@ contact us directly on the [NGINX Community Forum][forum].
 
 [bug]: https://github.com/nginx/nginx-gateway-fabric/issues/new?assignees=&labels=&projects=&template=bug_report.md&title=
 [idea]: https://github.com/nginx/nginx-gateway-fabric/discussions/categories/ideas
-[forum]: https://community.nginx.org/
+[forum]: https://community.nginx.org/c/projects/nginx-gateway-fabric/25
 
 ## Community Meetings
 

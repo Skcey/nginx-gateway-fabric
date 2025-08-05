@@ -7,29 +7,33 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/go-logr/logr"
 	discoveryV1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	ngfAPIv1alpha1 "github.com/nginx/nginx-gateway-fabric/apis/v1alpha1"
-	ngfAPIv1alpha2 "github.com/nginx/nginx-gateway-fabric/apis/v1alpha2"
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/nginx/config/policies"
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/state/graph"
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/state/resolver"
-	"github.com/nginx/nginx-gateway-fabric/internal/framework/helpers"
+	ngfAPIv1alpha1 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha2"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/nginx/config/policies"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/resolver"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
 )
 
 const (
-	wildcardHostname     = "~^"
-	alpineSSLRootCAPath  = "/etc/ssl/cert.pem"
-	defaultErrorLogLevel = "info"
+	wildcardHostname               = "~^"
+	alpineSSLRootCAPath            = "/etc/ssl/cert.pem"
+	defaultErrorLogLevel           = "info"
+	DefaultWorkerConnections       = int32(1024)
+	DefaultNginxReadinessProbePort = int32(8081)
 )
 
 // BuildConfiguration builds the Configuration from the Graph.
 func BuildConfiguration(
 	ctx context.Context,
+	logger logr.Logger,
 	g *graph.Graph,
 	gateway *graph.Gateway,
 	serviceResolver resolver.ServiceResolver,
@@ -53,6 +57,7 @@ func BuildConfiguration(
 	backendGroups := buildBackendGroups(append(httpServers, sslServers...))
 	upstreams := buildUpstreams(
 		ctx,
+		logger,
 		gateway,
 		serviceResolver,
 		g.ReferencedServices,
@@ -69,19 +74,25 @@ func BuildConfiguration(
 		SSLServers:            sslServers,
 		TLSPassthroughServers: buildPassthroughServers(gateway),
 		Upstreams:             upstreams,
-		StreamUpstreams:       buildStreamUpstreams(ctx, gateway, serviceResolver, baseHTTPConfig.IPFamily),
-		BackendGroups:         backendGroups,
-		SSLKeyPairs:           buildSSLKeyPairs(g.ReferencedSecrets, gateway.Listeners),
+		StreamUpstreams: buildStreamUpstreams(
+			ctx,
+			logger,
+			gateway,
+			serviceResolver,
+			baseHTTPConfig.IPFamily),
+		BackendGroups: backendGroups,
+		SSLKeyPairs:   buildSSLKeyPairs(g.ReferencedSecrets, gateway.Listeners),
 		CertBundles: buildCertBundles(
 			buildRefCertificateBundles(g.ReferencedSecrets, g.ReferencedCaCertConfigMaps),
 			backendGroups,
 		),
-		Telemetry:        buildTelemetry(g, gateway),
-		BaseHTTPConfig:   baseHTTPConfig,
-		Logging:          buildLogging(gateway),
-		NginxPlus:        nginxPlus,
-		MainSnippets:     buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextMain),
-		AuxiliarySecrets: buildAuxiliarySecrets(g.PlusSecrets),
+		Telemetry:         buildTelemetry(g, gateway),
+		BaseHTTPConfig:    baseHTTPConfig,
+		Logging:           buildLogging(gateway),
+		NginxPlus:         nginxPlus,
+		MainSnippets:      buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextMain),
+		AuxiliarySecrets:  buildAuxiliarySecrets(g.PlusSecrets),
+		WorkerConnections: buildWorkerConnections(gateway),
 	}
 
 	return config
@@ -160,6 +171,7 @@ func buildPassthroughServers(gateway *graph.Gateway) []Layer4VirtualServer {
 // buildStreamUpstreams builds all stream upstreams.
 func buildStreamUpstreams(
 	ctx context.Context,
+	logger logr.Logger,
 	gateway *graph.Gateway,
 	serviceResolver resolver.ServiceResolver,
 	ipFamily IPFamilyType,
@@ -199,7 +211,13 @@ func buildStreamUpstreams(
 
 			allowedAddressType := getAllowedAddressType(ipFamily)
 
-			eps, err := serviceResolver.Resolve(ctx, br.SvcNsName, br.ServicePort, allowedAddressType)
+			eps, err := serviceResolver.Resolve(
+				ctx,
+				logger,
+				br.SvcNsName,
+				br.ServicePort,
+				allowedAddressType,
+			)
 			if err != nil {
 				errMsg = err.Error()
 			}
@@ -502,6 +520,8 @@ func (hpr *hostPathRules) upsertRoute(
 
 	var objectSrc *metav1.ObjectMeta
 
+	routeNsName := client.ObjectKeyFromObject(route.Source)
+
 	if GRPC {
 		objectSrc = &helpers.MustCastObject[*v1.GRPCRoute](route.Source).ObjectMeta
 	} else {
@@ -539,7 +559,7 @@ func (hpr *hostPathRules) upsertRoute(
 
 		var filters HTTPFilters
 		if rule.Filters.Valid {
-			filters = createHTTPFilters(rule.Filters.Filters, idx)
+			filters = createHTTPFilters(rule.Filters.Filters, idx, routeNsName)
 		} else {
 			filters = HTTPFilters{
 				InvalidFilter: &InvalidHTTPFilter{},
@@ -562,8 +582,6 @@ func (hpr *hostPathRules) upsertRoute(
 					hostRule.Path = path
 					hostRule.PathType = convertPathType(*m.Path.Type)
 				}
-
-				routeNsName := client.ObjectKeyFromObject(route.Source)
 
 				hostRule.GRPC = GRPC
 				hostRule.Policies = append(hostRule.Policies, pols...)
@@ -667,6 +685,7 @@ func (hpr *hostPathRules) maxServerCount() int {
 
 func buildUpstreams(
 	ctx context.Context,
+	logger logr.Logger,
 	gateway *graph.Gateway,
 	svcResolver resolver.ServiceResolver,
 	referencedServices map[types.NamespacedName]*graph.ReferencedService,
@@ -698,6 +717,7 @@ func buildUpstreams(
 				for _, br := range rule.BackendRefs {
 					if upstream := buildUpstream(
 						ctx,
+						logger,
 						br,
 						gateway,
 						svcResolver,
@@ -732,6 +752,7 @@ func buildUpstreams(
 
 func buildUpstream(
 	ctx context.Context,
+	logger logr.Logger,
 	br graph.BackendRef,
 	gateway *graph.Gateway,
 	svcResolver resolver.ServiceResolver,
@@ -757,9 +778,10 @@ func buildUpstream(
 
 	var errMsg string
 
-	eps, err := svcResolver.Resolve(ctx, br.SvcNsName, br.ServicePort, allowedAddressType)
+	eps, err := svcResolver.Resolve(ctx, logger, br.SvcNsName, br.ServicePort, allowedAddressType)
 	if err != nil {
 		errMsg = err.Error()
+		logger.Error(err, "failed to resolve endpoints", "service", br.SvcNsName)
 	}
 
 	var upstreamPolicies []policies.Policy
@@ -803,7 +825,7 @@ func getPath(path *v1.HTTPPathMatch) string {
 	return *path.Value
 }
 
-func createHTTPFilters(filters []graph.Filter, ruleIdx int) HTTPFilters {
+func createHTTPFilters(filters []graph.Filter, ruleIdx int, routeNsName types.NamespacedName) HTTPFilters {
 	var result HTTPFilters
 
 	for _, f := range filters {
@@ -821,7 +843,7 @@ func createHTTPFilters(filters []graph.Filter, ruleIdx int) HTTPFilters {
 		case graph.FilterRequestMirror:
 			result.RequestMirrors = append(
 				result.RequestMirrors,
-				convertHTTPRequestMirrorFilter(f.RequestMirror, ruleIdx),
+				convertHTTPRequestMirrorFilter(f.RequestMirror, ruleIdx, routeNsName),
 			)
 		case graph.FilterRequestHeaderModifier:
 			if result.RequestHeaderModifiers == nil {
@@ -972,9 +994,10 @@ func buildBaseHTTPConfig(
 ) BaseHTTPConfig {
 	baseConfig := BaseHTTPConfig{
 		// HTTP2 should be enabled by default
-		HTTP2:    true,
-		IPFamily: Dual,
-		Snippets: buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextHTTP),
+		HTTP2:                   true,
+		IPFamily:                Dual,
+		Snippets:                buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextHTTP),
+		NginxReadinessProbePort: DefaultNginxReadinessProbePort,
 	}
 
 	// safe to access EffectiveNginxProxy since we only call this function when the Gateway is not nil.
@@ -987,6 +1010,10 @@ func buildBaseHTTPConfig(
 		baseConfig.HTTP2 = false
 	}
 
+	if np.DisableSNIHostValidation != nil && *np.DisableSNIHostValidation {
+		baseConfig.DisableSNIHostValidation = true
+	}
+
 	if np.IPFamily != nil {
 		switch *np.IPFamily {
 		case ngfAPIv1alpha2.IPv4:
@@ -996,28 +1023,47 @@ func buildBaseHTTPConfig(
 		}
 	}
 
-	if np.RewriteClientIP != nil {
-		if np.RewriteClientIP.Mode != nil {
-			switch *np.RewriteClientIP.Mode {
-			case ngfAPIv1alpha2.RewriteClientIPModeProxyProtocol:
-				baseConfig.RewriteClientIPSettings.Mode = RewriteIPModeProxyProtocol
-			case ngfAPIv1alpha2.RewriteClientIPModeXForwardedFor:
-				baseConfig.RewriteClientIPSettings.Mode = RewriteIPModeXForwardedFor
-			}
-		}
+	baseConfig.RewriteClientIPSettings = buildRewriteClientIPConfig(np.RewriteClientIP)
 
-		if len(np.RewriteClientIP.TrustedAddresses) > 0 {
-			baseConfig.RewriteClientIPSettings.TrustedAddresses = convertAddresses(
-				np.RewriteClientIP.TrustedAddresses,
-			)
+	if np.Kubernetes != nil {
+		var containerSpec *ngfAPIv1alpha2.ContainerSpec
+		if np.Kubernetes.Deployment != nil {
+			containerSpec = &np.Kubernetes.Deployment.Container
+		} else if np.Kubernetes.DaemonSet != nil {
+			containerSpec = &np.Kubernetes.DaemonSet.Container
 		}
-
-		if np.RewriteClientIP.SetIPRecursively != nil {
-			baseConfig.RewriteClientIPSettings.IPRecursive = *np.RewriteClientIP.SetIPRecursively
+		if containerSpec != nil && containerSpec.ReadinessProbe != nil && containerSpec.ReadinessProbe.Port != nil {
+			baseConfig.NginxReadinessProbePort = *containerSpec.ReadinessProbe.Port
 		}
 	}
 
 	return baseConfig
+}
+
+func buildRewriteClientIPConfig(rewriteClientIPConfig *ngfAPIv1alpha2.RewriteClientIP) RewriteClientIPSettings {
+	var rewriteClientIPSettings RewriteClientIPSettings
+	if rewriteClientIPConfig != nil {
+		if rewriteClientIPConfig.Mode != nil {
+			switch *rewriteClientIPConfig.Mode {
+			case ngfAPIv1alpha2.RewriteClientIPModeProxyProtocol:
+				rewriteClientIPSettings.Mode = RewriteIPModeProxyProtocol
+			case ngfAPIv1alpha2.RewriteClientIPModeXForwardedFor:
+				rewriteClientIPSettings.Mode = RewriteIPModeXForwardedFor
+			}
+		}
+
+		if len(rewriteClientIPConfig.TrustedAddresses) > 0 {
+			rewriteClientIPSettings.TrustedAddresses = convertAddresses(
+				rewriteClientIPConfig.TrustedAddresses,
+			)
+		}
+
+		if rewriteClientIPConfig.SetIPRecursively != nil {
+			rewriteClientIPSettings.IPRecursive = *rewriteClientIPConfig.SetIPRecursively
+		}
+	}
+
+	return rewriteClientIPSettings
 }
 
 func createSnippetName(nc ngfAPIv1alpha1.NginxContext, nsname types.NamespacedName) string {
@@ -1105,6 +1151,19 @@ func buildLogging(gateway *graph.Gateway) Logging {
 	return logSettings
 }
 
+func buildWorkerConnections(gateway *graph.Gateway) int32 {
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return DefaultWorkerConnections
+	}
+
+	ngfProxy := gateway.EffectiveNginxProxy
+	if ngfProxy.WorkerConnections != nil {
+		return *ngfProxy.WorkerConnections
+	}
+
+	return DefaultWorkerConnections
+}
+
 func buildAuxiliarySecrets(
 	secrets map[types.NamespacedName][]graph.PlusSecretFile,
 ) map[graph.SecretFileType][]byte {
@@ -1143,8 +1202,9 @@ func buildNginxPlus(gateway *graph.Gateway) NginxPlus {
 
 func GetDefaultConfiguration(g *graph.Graph, gateway *graph.Gateway) Configuration {
 	return Configuration{
-		Logging:          buildLogging(gateway),
-		NginxPlus:        NginxPlus{},
-		AuxiliarySecrets: buildAuxiliarySecrets(g.PlusSecrets),
+		Logging:           buildLogging(gateway),
+		NginxPlus:         NginxPlus{},
+		AuxiliarySecrets:  buildAuxiliarySecrets(g.PlusSecrets),
+		WorkerConnections: buildWorkerConnections(gateway),
 	}
 }

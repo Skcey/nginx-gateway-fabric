@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -9,20 +10,23 @@ import (
 	"strconv"
 	"time"
 
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	ngfAPIv1alpha2 "github.com/nginx/nginx-gateway-fabric/apis/v1alpha2"
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/config"
-	"github.com/nginx/nginx-gateway-fabric/internal/controller/state/graph"
-	"github.com/nginx/nginx-gateway-fabric/internal/framework/controller"
-	"github.com/nginx/nginx-gateway-fabric/internal/framework/helpers"
+	ngfAPIv1alpha2 "github.com/nginx/nginx-gateway-fabric/v2/apis/v1alpha2"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/config"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/dataplane"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/controller/state/graph"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/controller"
+	"github.com/nginx/nginx-gateway-fabric/v2/internal/framework/helpers"
 )
 
 const (
@@ -33,9 +37,10 @@ const (
 	defaultServiceType   = corev1.ServiceTypeLoadBalancer
 	defaultServicePolicy = corev1.ServiceExternalTrafficPolicyLocal
 
-	defaultNginxImagePath     = "ghcr.io/nginx/nginx-gateway-fabric/nginx"
-	defaultNginxPlusImagePath = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"
-	defaultImagePullPolicy    = corev1.PullIfNotPresent
+	defaultNginxImagePath      = "ghcr.io/nginx/nginx-gateway-fabric/nginx"
+	defaultNginxPlusImagePath  = "private-registry.nginx.com/nginx-gateway-fabric/nginx-plus"
+	defaultImagePullPolicy     = corev1.PullIfNotPresent
+	defaultInitialDelaySeconds = int32(3)
 )
 
 var emptyDirVolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
@@ -45,6 +50,8 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 	gateway *gatewayv1.Gateway,
 	nProxyCfg *graph.EffectiveNginxProxy,
 ) ([]client.Object, error) {
+	var errs []error
+
 	// Need to ensure nginx resource objects are generated deterministically. Specifically when generating
 	// an object's field by ranging over a map, since ranging over a map is done in random order, we need to
 	// do some processing to ensure the generated results are the same each time.
@@ -106,6 +113,9 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		caSecretName,
 		clientSSLSecretName,
 	)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	configmaps := p.buildNginxConfigMaps(
 		objectMeta,
@@ -131,8 +141,12 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		ports[int32(listener.Port)] = struct{}{}
 	}
 
-	service := buildNginxService(objectMeta, nProxyCfg, ports, selectorLabels)
-	deployment := p.buildNginxDeployment(
+	service, err := buildNginxService(objectMeta, nProxyCfg, ports, selectorLabels)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	deployment, err := p.buildNginxDeployment(
 		objectMeta,
 		nProxyCfg,
 		ngxIncludesConfigMapName,
@@ -145,6 +159,9 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 		caSecretName,
 		clientSSLSecretName,
 	)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	// order to install resources:
 	// secrets
@@ -163,7 +180,7 @@ func (p *NginxProvisioner) buildNginxResourceObjects(
 	}
 	objects = append(objects, service, deployment)
 
-	return objects, err
+	return objects, errors.Join(errs...)
 }
 
 func (p *NginxProvisioner) buildNginxSecrets(
@@ -317,8 +334,14 @@ func (p *NginxProvisioner) buildNginxConfigMaps(
 		logLevel = string(*nProxyCfg.Logging.ErrorLevel)
 	}
 
+	workerConnections := dataplane.DefaultWorkerConnections
+	if nProxyCfg != nil && nProxyCfg.WorkerConnections != nil {
+		workerConnections = *nProxyCfg.WorkerConnections
+	}
+
 	mainFields := map[string]interface{}{
-		"ErrorLevel": logLevel,
+		"ErrorLevel":        logLevel,
+		"WorkerConnections": workerConnections,
 	}
 
 	bootstrapCM := &corev1.ConfigMap{
@@ -413,7 +436,7 @@ func buildNginxService(
 	nProxyCfg *graph.EffectiveNginxProxy,
 	ports map[int32]struct{},
 	selectorLabels map[string]string,
-) *corev1.Service {
+) (*corev1.Service, error) {
 	var serviceCfg ngfAPIv1alpha2.ServiceSpec
 	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil && nProxyCfg.Kubernetes.Service != nil {
 		serviceCfg = *nProxyCfg.Kubernetes.Service
@@ -470,17 +493,16 @@ func buildNginxService(
 
 	setIPFamily(nProxyCfg, svc)
 
-	if serviceCfg.LoadBalancerIP != nil {
-		svc.Spec.LoadBalancerIP = *serviceCfg.LoadBalancerIP
-	}
-	if serviceCfg.LoadBalancerClass != nil {
-		svc.Spec.LoadBalancerClass = serviceCfg.LoadBalancerClass
-	}
-	if serviceCfg.LoadBalancerSourceRanges != nil {
-		svc.Spec.LoadBalancerSourceRanges = serviceCfg.LoadBalancerSourceRanges
+	setSvcLoadBalancerSettings(serviceCfg, &svc.Spec)
+
+	// Apply service patches
+	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil && nProxyCfg.Kubernetes.Service != nil {
+		if err := applyPatches(svc, nProxyCfg.Kubernetes.Service.Patches); err != nil {
+			return svc, fmt.Errorf("failed to apply service patches: %w", err)
+		}
 	}
 
-	return svc
+	return svc, nil
 }
 
 func setIPFamily(nProxyCfg *graph.EffectiveNginxProxy, svc *corev1.Service) {
@@ -491,6 +513,18 @@ func setIPFamily(nProxyCfg *graph.EffectiveNginxProxy, svc *corev1.Service) {
 		} else {
 			svc.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv6Protocol}
 		}
+	}
+}
+
+func setSvcLoadBalancerSettings(svcCfg ngfAPIv1alpha2.ServiceSpec, svcSpec *corev1.ServiceSpec) {
+	if svcCfg.LoadBalancerIP != nil {
+		svcSpec.LoadBalancerIP = *svcCfg.LoadBalancerIP
+	}
+	if svcCfg.LoadBalancerClass != nil {
+		svcSpec.LoadBalancerClass = svcCfg.LoadBalancerClass
+	}
+	if svcCfg.LoadBalancerSourceRanges != nil {
+		svcSpec.LoadBalancerSourceRanges = svcCfg.LoadBalancerSourceRanges
 	}
 }
 
@@ -506,7 +540,7 @@ func (p *NginxProvisioner) buildNginxDeployment(
 	jwtSecretName string,
 	caSecretName string,
 	clientSSLSecretName string,
-) client.Object {
+) (client.Object, error) {
 	podTemplateSpec := p.buildNginxPodTemplateSpec(
 		objectMeta,
 		nProxyCfg,
@@ -521,7 +555,7 @@ func (p *NginxProvisioner) buildNginxDeployment(
 	)
 
 	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil && nProxyCfg.Kubernetes.DaemonSet != nil {
-		return &appsv1.DaemonSet{
+		daemonSet := &appsv1.DaemonSet{
 			ObjectMeta: objectMeta,
 			Spec: appsv1.DaemonSetSpec{
 				Selector: &metav1.LabelSelector{
@@ -530,6 +564,13 @@ func (p *NginxProvisioner) buildNginxDeployment(
 				Template: podTemplateSpec,
 			},
 		}
+
+		// Apply DaemonSet patches
+		if err := applyPatches(daemonSet, nProxyCfg.Kubernetes.DaemonSet.Patches); err != nil {
+			return daemonSet, fmt.Errorf("failed to apply daemonset patches: %w", err)
+		}
+
+		return daemonSet, nil
 	}
 
 	deployment := &appsv1.Deployment{
@@ -545,13 +586,77 @@ func (p *NginxProvisioner) buildNginxDeployment(
 	var deploymentCfg ngfAPIv1alpha2.DeploymentSpec
 	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil && nProxyCfg.Kubernetes.Deployment != nil {
 		deploymentCfg = *nProxyCfg.Kubernetes.Deployment
+		// Apply Deployment patches
+		if err := applyPatches(deployment, nProxyCfg.Kubernetes.Deployment.Patches); err != nil {
+			return deployment, fmt.Errorf("failed to apply deployment patches: %w", err)
+		}
 	}
 
 	if deploymentCfg.Replicas != nil {
 		deployment.Spec.Replicas = deploymentCfg.Replicas
 	}
 
-	return deployment
+	return deployment, nil
+}
+
+// applyPatches applies the provided patches to the given object.
+func applyPatches(obj client.Object, patches []ngfAPIv1alpha2.Patch) error {
+	if len(patches) == 0 {
+		return nil
+	}
+
+	// Convert object to JSON
+	objData, err := json.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal object: %w", err)
+	}
+
+	// Apply each patch in sequence
+	for i, patch := range patches {
+		if patch.Value == nil || len(patch.Value.Raw) == 0 {
+			continue
+		}
+		patchType := ngfAPIv1alpha2.PatchTypeStrategicMerge
+		if patch.Type != nil {
+			patchType = *patch.Type
+		}
+
+		patchData := patch.Value.Raw
+		var patchedData []byte
+
+		switch patchType {
+		case ngfAPIv1alpha2.PatchTypeStrategicMerge:
+			patchedData, err = strategicpatch.StrategicMergePatch(objData, patchData, obj)
+			if err != nil {
+				return fmt.Errorf("failed to apply %s patch %d: %w", patchType, i, err)
+			}
+		case ngfAPIv1alpha2.PatchTypeMerge:
+			patchedData, err = jsonpatch.MergePatch(objData, patchData)
+			if err != nil {
+				return fmt.Errorf("failed to apply %s patch %d: %w", patchType, i, err)
+			}
+		case ngfAPIv1alpha2.PatchTypeJSONPatch:
+			jsonPatch, err := jsonpatch.DecodePatch(patchData)
+			if err != nil {
+				return fmt.Errorf("failed to decode json patch %d: %w", i, err)
+			}
+			patchedData, err = jsonPatch.Apply(objData)
+			if err != nil {
+				return fmt.Errorf("failed to apply %s patch %d: %w", patchType, i, err)
+			}
+		default:
+			return fmt.Errorf("unsupported patch type: %s", patchType)
+		}
+
+		objData = patchedData
+	}
+
+	// Unmarshal back to object
+	if err := json.Unmarshal(objData, obj); err != nil {
+		return fmt.Errorf("failed to unmarshal patched object: %w", err)
+	}
+
+	return nil
 }
 
 //nolint:gocyclo // will refactor at some point
@@ -616,6 +721,7 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 					Image:           image,
 					ImagePullPolicy: pullPolicy,
 					Ports:           containerPorts,
+					ReadinessProbe:  p.buildReadinessProbe(nProxyCfg),
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: helpers.GetPointer(false),
 						Capabilities: &corev1.Capabilities{
@@ -788,6 +894,15 @@ func (p *NginxProvisioner) buildNginxPodTemplateSpec(
 				container.Command = append(container.Command, "/agent/entrypoint.sh")
 				container.Args = append(container.Args, "debug")
 			}
+
+			for _, hostPort := range containerSpec.HostPorts {
+				for i, port := range container.Ports {
+					if hostPort.ContainerPort == port.ContainerPort {
+						container.Ports[i].HostPort = hostPort.Port
+					}
+				}
+			}
+
 			spec.Spec.Containers[0] = container
 		}
 	}
@@ -1020,4 +1135,40 @@ func (p *NginxProvisioner) buildNginxResourceObjectsForDeletion(deploymentNSName
 	}
 
 	return objects
+}
+
+// buildReadinessProbe creates a readiness probe configuration for the NGINX container.
+func (p *NginxProvisioner) buildReadinessProbe(nProxyCfg *graph.EffectiveNginxProxy) *corev1.Probe {
+	probe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readyz",
+				Port: intstr.FromInt32(dataplane.DefaultNginxReadinessProbePort),
+			},
+		},
+		InitialDelaySeconds: defaultInitialDelaySeconds,
+	}
+
+	var containerSpec *ngfAPIv1alpha2.ContainerSpec
+	if nProxyCfg != nil && nProxyCfg.Kubernetes != nil {
+		if nProxyCfg.Kubernetes.Deployment != nil {
+			containerSpec = &nProxyCfg.Kubernetes.Deployment.Container
+		} else if nProxyCfg.Kubernetes.DaemonSet != nil {
+			containerSpec = &nProxyCfg.Kubernetes.DaemonSet.Container
+		}
+	}
+
+	if containerSpec == nil || containerSpec.ReadinessProbe == nil {
+		return probe
+	}
+
+	if containerSpec.ReadinessProbe.Port != nil {
+		probe.HTTPGet.Port = intstr.FromInt32(*containerSpec.ReadinessProbe.Port)
+	}
+
+	if containerSpec.ReadinessProbe.InitialDelaySeconds != nil {
+		probe.InitialDelaySeconds = *containerSpec.ReadinessProbe.InitialDelaySeconds
+	}
+
+	return probe
 }

@@ -7,12 +7,12 @@ GINKGO_FLAGS =
 GINKGO_LABEL =
 GITHUB_OUTPUT =
 GW_API_VERSION ?= $(shell sed -n 's/.*ref=v\(.*\)/\1/p' ../config/crd/gateway-api/standard/kustomization.yaml)## Supported Gateway API version from current NGF
-GW_API_PREV_VERSION ?= 1.2.1## Supported Gateway API version from previous NGF release
+GW_API_PREV_VERSION ?= 1.3.0## Supported Gateway API version from previous NGF release
 GW_SERVICE_TYPE = NodePort## Service type to use for the gateway
 NGF_VERSION ?= edge## NGF version to be tested
 PULL_POLICY = Never## Pull policy for the images
 NGINX_CONF_DIR = internal/controller/nginx/conf
-SUPPORTED_EXTENDED_FEATURES = HTTPRouteQueryParamMatching,HTTPRouteMethodMatching,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRouteHostRewrite,HTTPRoutePathRewrite,GatewayPort8080,HTTPRouteResponseHeaderModification,HTTPRoutePathRedirect,GatewayHTTPListenerIsolation,GatewayInfrastructurePropagation,HTTPRouteRequestMirror,HTTPRouteRequestMultipleMirrors
+SUPPORTED_EXTENDED_FEATURES = HTTPRouteQueryParamMatching,HTTPRouteMethodMatching,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRouteHostRewrite,HTTPRoutePathRewrite,GatewayPort8080,GatewayAddressEmpty,HTTPRouteResponseHeaderModification,HTTPRoutePathRedirect,GatewayHTTPListenerIsolation,GatewayInfrastructurePropagation,HTTPRouteRequestMirror,HTTPRouteRequestMultipleMirrors,HTTPRouteRequestPercentageMirror,HTTPRouteBackendProtocolWebSocket
 STANDARD_CONFORMANCE_PROFILES = GATEWAY-HTTP,GATEWAY-GRPC
 EXPERIMENTAL_CONFORMANCE_PROFILES = GATEWAY-TLS
 CONFORMANCE_PROFILES = $(STANDARD_CONFORMANCE_PROFILES) # by default we use the standard conformance profiles. If experimental is enabled we override this and add the experimental profiles.
@@ -120,8 +120,8 @@ stop-longevity-test: nfr-test ## Stop the longevity test and collects results
 
 .PHONY: .vm-nfr-test
 .vm-nfr-test: ## Runs the NFR tests on the GCP VM (called by `nfr-test`)
-	go run github.com/onsi/ginkgo/v2/ginkgo --randomize-all --randomize-suites --keep-going \
-		--trace -r -v --buildvcs --force-newlines $(GITHUB_OUTPUT) \
+	CGO_ENABLED=1 go run github.com/onsi/ginkgo/v2/ginkgo --race --randomize-all --randomize-suites --keep-going --fail-on-pending \
+		--trace -r -v --buildvcs --force-newlines $(GITHUB_OUTPUT) --flake-attempts=2 \
 		--label-filter "nfr" $(GINKGO_FLAGS) --timeout 5h ./suite --  --gateway-api-version=$(GW_API_VERSION) \
 		--gateway-api-prev-version=$(GW_API_PREV_VERSION) --image-tag=$(TAG) --version-under-test=$(NGF_VERSION) \
 		--ngf-image-repo=$(PREFIX) --nginx-image-repo=$(NGINX_PREFIX) --nginx-plus-image-repo=$(NGINX_PLUS_PREFIX) \
@@ -132,7 +132,7 @@ stop-longevity-test: nfr-test ## Stop the longevity test and collects results
 .PHONY: test
 test: build-crossplane-image ## Runs the functional tests on your kind k8s cluster
 	kind load docker-image nginx-crossplane:latest --name $(CLUSTER_NAME)
-	go run github.com/onsi/ginkgo/v2/ginkgo --randomize-all --randomize-suites --keep-going \
+	go run github.com/onsi/ginkgo/v2/ginkgo --race --randomize-all --randomize-suites --keep-going --fail-on-pending \
 		--trace -r -v --buildvcs --force-newlines $(GITHUB_OUTPUT) \
 		--label-filter "functional" $(GINKGO_FLAGS) ./suite -- \
 		--gateway-api-version=$(GW_API_VERSION) --gateway-api-prev-version=$(GW_API_PREV_VERSION) \
@@ -165,7 +165,7 @@ delete-gke-cluster: ## Delete the GKE cluster
 add-local-ip-to-cluster: ## Add local IP to the GKE cluster master-authorized-networks
 	./scripts/add-local-ip-auth-networks.sh
 
-HELM_PARAMETERS += --set nameOverride=nginx-gateway --set nginx.service.type=ClusterIP --skip-schema-validation
+HELM_PARAMETERS += --set nginxGateway.name=nginx-gateway --set nginx.service.type=ClusterIP --skip-schema-validation
 
 # this target is used to install the gateway-api CRDs from the main branch (only used in the nightly CI job)
 # it overrides the target in the main Makefile when the GW_API_VERSION is set to main

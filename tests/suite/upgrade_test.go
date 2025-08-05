@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	"github.com/nginx/nginx-gateway-fabric/tests/framework"
+	"github.com/nginx/nginx-gateway-fabric/v2/tests/framework"
 )
 
 // This test installs the latest released version of NGF, then upgrades to the edge version (or dev version).
@@ -92,7 +92,6 @@ var _ = PDescribe("Upgrade testing", Label("nfr", "upgrade"), func() {
 	})
 
 	It("upgrades NGF with zero downtime", func() {
-		Skip("Skipping test until version 2.1.0 since 2.0.0 is a breaking change")
 		nginxImage := *nginxImageRepository
 		if *plusEnabled {
 			nginxImage = *nginxPlusImageRepository
